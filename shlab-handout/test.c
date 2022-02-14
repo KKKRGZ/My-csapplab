@@ -84,10 +84,7 @@ void unix_error(char *msg);
 void app_error(char *msg);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
-
 pid_t Fork(void);
-void Execve(const char *filename, char *const argv[], char *const envp[]);
-void Setpgid(pid_t pid, pid_t pgid);
 /*
  * main - The shell's main routine 
  */
@@ -169,65 +166,77 @@ int main(int argc, char **argv)
 void eval(char *cmdline) 
 {   
     char *argv[MAXARGS];
-    char buf[MAXLINE];
+    char *buf[MAXLINE];
     int bg;
     pid_t pid;
     sigset_t mask_all,mask_one,prev_mask;
-
+    
     strcpy(buf,cmdline);
-    bg = parseline(buf,argv);
+    bg = parseline(buf,argv); // bg is meaning the number of background jobs
     
     if(argv[0]==NULL)
         return;
-    /*
-        sigfillset(&mask_all):添加所有信号到 set mask_all中
-        sigemptyset(&mask_one): 把set mask_one 置为空
-        sigaddset(&mask_one,SIGCHLD) 向mask_one 这个set 中添加阻塞信号SIGCHLD
-    */
+    
+    // 设置信号阻塞 按照书上的方式 防止条件竞争
     sigfillset(&mask_all);
     sigemptyset(&mask_one);
     sigaddset(&mask_one,SIGCHLD);
-    if(!builtin_cmd(argv))// builtin_cmd 处理内置命令
-    {   
-    /*
-        阻塞信号SIGCHLD信号 防止父进程还未把job 添加到job list前
-        子进程就退出了
-        保证父进程先add ，子进程再delete 防止条件竞争出现bug
-    */
+    if(!builtin_cmd(argv))// builtin_cmd 处理后台设置的默认命令
+    {
+
+
+        /* 
+            避免出现在父进程运行到addjob之前，子进程就已经退出了产生的bug
+            在fork前提前阻塞SIGCHLD信号,不让子进程提前退出
+            在addjob 后解除阻塞，让子进程正常退出
+        */
         sigprocmask(SIG_BLOCK,&mask_one,&prev_mask);
         if((pid=Fork())==0)
-        {   /*
-            子进程不需要阻塞SIGCHLD 信号
-            */
-            sigprocmask(SIG_SETMASK,&prev_mask,NULL);
-            Setpgid(0,0);
-            Execve(argv[0],argv,environ);
-        }
-        /*
-            在addjob 前设置阻塞所有信号，保证addjob 正常把子进程添加到job list
-            addjob 后解除
-        */
-        sigprocmask(SIG_BLOCK,&mask_all,NULL);
-        addjob(jobs, pid , bg + 1, cmdline); /* 将子进程添加到 job list 列表中 FG 1 、BG 2 */
-        sigprocmask(SIG_SETMASK,&prev_mask,NULL);
-
-        if(!bg)
-        {
+        {   
+            //子进程继承父进程阻塞向量，需要解除阻塞
+            //避免收不到它本身的子向量的信号
+            sigprocmask(SIG_SETMASK,&prev_mask,NULL);//子进程不需要阻塞
+            
             /*
-            如果没有要后台执行的进程，那么就都是前台进程
-            每次执行下一个前台进程前，要等待当前前台进程完成后才能执行下一个
+                setpgid将子进程组与tsh进程组分开了,避免子进程组停止
+                把tsh一起停止掉,同时子进程组id 就等于pid
+                注意:子进程组 id 不等于题目中jid
+                jid 等于pid 在jobs列表中的序号
             */
-            waitfg(pid);
-        }
-        else
-            printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
-    }
-    return;
-    
-     // bg is meaning the number of background jobs
-    //printf("bg ==>:%d\n",bg);
+            if(setpgid(0,0) < 0) 
+            {
+                perror("SETPGID ERROR!");
+                exit(0);
+            }
 
-    
+            if(execve(argv[0], argv, environ) < 0)
+            {
+                printf("%s: Command not found\n", argv[0]);
+                exit(0);
+            }
+        }
+    }
+    if(!bg)
+    {
+        // 如果不是后台进程的情况 阻塞所有信号 防止addjob处理中断 
+        // 阻塞一切信号 添加到jobs列表
+
+        sigprocmask(SIG_BLOCK,&mask_all,NULL);
+        addjob(jobs,pid,FG,cmdline);
+        sigprocmask(SIG_SETMASK,&prev_mask,NULL);
+        waitfg(pid)
+    }
+    else
+    {
+        addjob(jobs, pid, BG, cmdline);
+        printf("JID:[%d] PID:(%d) %s",pid2jid(pid),pid,cmdline);
+        /* 打印全局变量时候一样要阻塞所有信号 ,防止途中被中断导致结果不正确
+            可能造成还未读(写)内存而内存的值却被修改的情况
+        */
+        sigprocmask(SIG_SETMASK,&prev_mask,NULL);
+    }
+        
+    return;
 }
 
 /* 
@@ -306,7 +315,8 @@ int builtin_cmd(char **argv)
     else
         return 0;// 如果不是上面的内置命令就返回0
     
-    return 1;     //如果是内置命令就最终返回1 
+    //如果是内置命令就最终返回1
+    return 1;     /* not a builtin command */
 }
 
 /* 
@@ -314,19 +324,18 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {   
-
-    struct job_t* job=NULL;
-    int idx;
     if(argv[1]==NULL)
     {
         printf("%s Command requires PID or %%jobid argument\n",argv[0]);
         return;
     }
+    struct job_t* job=NULL;
+    int idx;
     /*
     bg 5 和 bg %5 不一样 一个是对PID操作，一个是对job 操作
     job代表一个任务
     */
-    if(sscanf(argv[1],"%%%d",&idx) > 0)
+    if(sscanf(argv[1],"%d",&idx) > 0)
     {
         job=getjobjid(jobs,idx);
         if(job == NULL)
@@ -335,7 +344,7 @@ void do_bgfg(char **argv)
             return;
         }
     }
-    else if(sscanf(argv[1],"%d",&idx) > 0)
+    else if(sscanf(argv[1],"%%%d",&idx) > 0)
     {
         job = getjobpid(jobs,idx);
         if(job == NULL)
@@ -359,7 +368,7 @@ void do_bgfg(char **argv)
     if(!strcmp(argv[0],"bg"))
     {
         job->state = BG;//设置状态
-        printf("[%d] (%d) %s",job->jid,job->pid,job->cmdline);
+        printf("[%d] (%d) %s",job->jid,job->pid,argv[0]);
     }
     else
     {// 如果fg 后台进程 ，此进程状态转换位前台进程，要waitfg 等待其终止
@@ -372,29 +381,10 @@ void do_bgfg(char **argv)
 /* 
  * waitfg - Block until process pid is no longer the foreground process
  */
-// void waitfg(pid_t pid)
-// {   sigset_t mask,prev;
-//     sigemptyset(&mask);
-//     sigaddset(&mask,SIGCHLD);
-//     sigprocmask(SIG_BLOCK,&mask,&prev);
-//     while(fgpid(jobs)!=0)
-//     {
-//         sigsuspend(&mask);
-//         /*
-//         参考书上 8.5.7内容
-//         */
-//     }
-//     sigprocmask(SIG_SETMASK,&prev,NULL);
-//     return;
-// }
 void waitfg(pid_t pid)
 {   sigset_t mask,prev;
     sigemptyset(&mask);
-    /*
-    设置不阻塞任何信号
-    这里如果阻塞SIGCHLD 在命令输入错误的情况下
-    子进程会无法被回收退出
-    */
+    sigaddset(&mask,SIGCHLD);
     sigprocmask(SIG_BLOCK,&mask,&prev);
     while(fgpid(jobs)!=0)
     {
@@ -403,7 +393,7 @@ void waitfg(pid_t pid)
         参考书上 8.5.7内容
         */
     }
-    sigprocmask(SIG_SETMASK, &prev, NULL);  
+    sigprocmask(SIG_SETMASK,&prev,NULL);
     return;
 }
 
@@ -427,8 +417,8 @@ void sigchld_handler(int sig)
     int status;
     pid_t pid;
     struct job_t *job;
-    sigset_t mask_all,prev_all;
-    sigfillset(&mask_all);//设置安全阻塞 防止干扰 这里目的应该是阻塞所有信号
+    sigset_t mask,prev;
+    sigfillset(&mask);//设置安全阻塞 防止干扰 这里目的应该是阻塞所有信号
     while( (pid = waitpid(-1,&status,WNOHANG | WUNTRACED)) > 0)
     {   
         /*
@@ -440,14 +430,16 @@ void sigchld_handler(int sig)
 
         status:waitpid会把等待终止或停止的子进程的状态返回到status 中
         */
-        sigprocmask(SIG_BLOCK,&mask_all,&prev_all);
+        sigprocmask(SIG_BLOCK,&mask,&prev);
 
         /* status 存有已经退出子进程的退出状态
             WIFEXITED(status) 如果子进程通过exit 或return正常退出,WIFEXITED()函数返回真
         */
         if(WIFEXITED(status))
         {
+            sigprocmask(SIG_BLOCK,&mask,&prev);
             deletejob(jobs,pid);
+            sigprocmask(SIG_SETMASK,&prev,NULL);
         }
         else if(WIFSIGNALED(status))
         {
@@ -460,7 +452,7 @@ void sigchld_handler(int sig)
             job = getjobpid(jobs,pid);
             job->state = ST;
         }
-        sigprocmask(SIG_SETMASK,&prev_all,NULL);
+        sigprocmask(SIG_SETMASK,&prev,NULL);
     }
     errno = olderrno;
     return;
@@ -712,9 +704,6 @@ void sigquit_handler(int sig)
     exit(1);
 }
 
-/* packed function 
- *
- */
 pid_t Fork(void)
 {
     pid_t pid;
@@ -725,20 +714,3 @@ pid_t Fork(void)
     return pid;
 }
 
-void Execve(const char *filename, char *const argv[], char *const envp[])
-{
-    if(execve(filename, argv, environ) < 0)
-    {
-        printf("%s: Command not found.\n",argv[0]);
-        exit(0);
-    }
-}
-
-void Setpgid(pid_t pid, pid_t pgid)
-{
-    int rc;
-    if((rc = setpgid(pid,pgid)) < 0)
-        unix_error("Setpgid error");
-        return;
-    
-}
